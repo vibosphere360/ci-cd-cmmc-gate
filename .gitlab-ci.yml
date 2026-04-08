@@ -1,0 +1,96 @@
+stages:
+  - cui-scan
+  - iac-validate
+  - opa-gates
+  - evidence-collect
+  - ai-analysis
+  - compliance-report
+
+variables:
+  EVIDENCE_BUCKET: "ci-cd-cmmc-gate-evidence-vadeleke-vibosphere"
+  CMMC_LEVEL: "2"
+
+# Stage 1 — CUI & Secret Scanning
+cui-secret-scan:
+  stage: cui-scan
+  image: python:3.11-slim
+  tags: [cmmc, opa, compliance]
+  script:
+    - pip install detect-secrets pip-audit semgrep presidio-analyzer -q
+    - python scripts/cui_classifier.py --scan-dir . --output cui-findings.json
+    - detect-secrets scan --all-files > .secrets.baseline || true
+    - pip-audit --output-format json > dep-scan.json || true
+    - semgrep --config auto scripts/ --json > sast-findings.json || true
+  artifacts:
+    paths: [cui-findings.json, dep-scan.json, sast-findings.json]
+    when: always
+    expire_in: 90 days
+
+# Stage 2 — IaC Validation
+iac-compliance:
+  stage: iac-validate
+  image: python:3.11-slim
+  tags: [cmmc, opa, compliance]
+  script:
+    - pip install checkov -q
+    - checkov -d terraform/ --framework terraform --output json > iac-findings.json || true
+  artifacts:
+    paths: [iac-findings.json]
+    when: always
+
+# Stage 3 — OPA CMMC Policy Gates
+opa-cmmc-gates:
+  stage: opa-gates
+  image: openpolicyagent/opa:latest
+  tags: [cmmc, opa, compliance]
+  script:
+    - python3 scripts/merge_findings.py
+    - opa eval --data policies/ --input merged-findings.json
+        'data.cmmc.deny' --format json > opa-results.json
+    - python3 scripts/opa_gate.py
+  artifacts:
+    paths: [opa-results.json, merged-findings.json]
+    when: always
+
+# Stage 4 — Evidence Collection
+evidence-collect:
+  stage: evidence-collect
+  image: python:3.11-slim
+  tags: [cmmc, opa, compliance]
+  script:
+    - pip install boto3 -q
+    - python scripts/evidence_collector.py
+        --pipeline-id ${CI_PIPELINE_ID}
+        --project ${CI_PROJECT_NAME}
+        --bucket ${EVIDENCE_BUCKET}
+        --kms-key ${KMS_KEY_ID}
+    - sha256sum *.json > checksums.sha256
+  artifacts:
+    paths: [evidence-bundle.json, checksums.sha256]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+# Stage 5 — AI Analysis
+ai-analysis:
+  stage: ai-analysis
+  image: python:3.11-slim
+  tags: [cmmc, opa, compliance]
+  script:
+    - pip install anthropic -q
+    - python scripts/ai_advisor.py
+        --violations opa-results.json
+        --output ai-remediation.json || true
+  artifacts:
+    paths: [ai-remediation.json]
+
+# Stage 6 — Compliance Report
+compliance-report:
+  stage: compliance-report
+  image: python:3.11-slim
+  tags: [cmmc, opa, compliance]
+  script:
+    - pip install jinja2 -q
+    - python scripts/generate_report.py --output compliance-report.html
+  artifacts:
+    paths: [compliance-report.html]
+    expose_as: 'CMMC Compliance Report'
